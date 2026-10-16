@@ -1787,35 +1787,24 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             // 3. SEND ANYWAY (STEER)
             if (data.startsWith(INTERRUPT_STEER_PREFIX)) {
                 try {
-                    await ctx.editMessageText('⚡ <b>Sent anyway!</b> Message injected into Antigravity concurrently.', { parse_mode: 'HTML' });
+                    await ctx.editMessageText('⚡ <b>Sending anyway…</b> Injected into Antigravity concurrently.', { parse_mode: 'HTML' });
                 } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
-                await ctx.answerCallbackQuery({ text: 'Sent anyway!' });
+                await ctx.answerCallbackQuery({ text: 'Sending anyway...' });
 
-                try {
-                    if (projectName) {
-                        const userMsgDetector = bridge.pool.getUserMessageDetector?.(projectName);
-                        if (userMsgDetector) userMsgDetector.addEchoHash(pending.prompt);
-                    }
+                const wsKey = promptDispatcher.getWorkspaceKey(pending.channel, dispatchCdp);
+                promptDispatcher.resetWorkspaceLock(wsKey);
+                setBypass(safeCallbackKey(wsKey));
 
-                    if (pending.inboundImages?.length) {
-                        const filePaths = pending.inboundImages.map(img => img.localPath);
-                        const injectRes = await dispatchCdp.injectMessageWithImageFiles(pending.prompt, filePaths);
-                        cleanupInboundImageAttachments(pending.inboundImages).catch(() => {});
-                        if (!injectRes.ok) {
-                            logger.warn('[interrupt:steer] injectMessageWithImageFiles failed:', injectRes.error);
-                            await bot.api.sendMessage(pending.channel.chatId, `⚠️ Could not inject message: ${injectRes.error}`, { message_thread_id: pending.channel.threadId });
-                        }
-                    } else {
-                        const injectRes = await dispatchCdp.injectMessage(pending.prompt);
-                        if (!injectRes.ok) {
-                            logger.warn('[interrupt:steer] injectMessage failed:', injectRes.error);
-                            await bot.api.sendMessage(pending.channel.chatId, `⚠️ Could not inject message: ${injectRes.error}`, { message_thread_id: pending.channel.threadId });
-                        }
-                    }
-                } catch (err: any) {
-                    logger.error('[interrupt:steer] failed to inject:', err);
-                    await bot.api.sendMessage(pending.channel.chatId, `❌ Failed to inject message: ${err.message}`, { message_thread_id: pending.channel.threadId });
-                }
+                // Small pause to let UI react before injecting next prompt
+                await new Promise(r => setTimeout(r, 200));
+
+                promptDispatcher.send({
+                    channel: pending.channel,
+                    prompt: pending.prompt,
+                    cdp: dispatchCdp,
+                    inboundImages: pending.inboundImages,
+                    options: pending.options,
+                }).catch((e) => { logger.error('[interrupt:steer] dispatch failed:', e); });
                 return;
             }
 

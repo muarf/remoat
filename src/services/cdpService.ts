@@ -1441,12 +1441,46 @@ export class CdpService extends EventEmitter {
         // 2. Send via Enter key
         await this.pressEnterToSend();
 
+        // If Antigravity placed the message into "Queued Messages", click "Send Now" to force dispatch
+        await new Promise(r => setTimeout(r, 250));
+        await this.clickQueuedSendNowButton(focusResult.contextId);
+
         // Follow the feed: pin the conversation to the newly sent turn after the
         // DOM has had a moment to append it (issue #4). Best-effort.
         await new Promise(r => setTimeout(r, 300));
         await this.scrollConversationToBottom(focusResult.contextId);
 
         return { ok: true, method: 'enter', contextId: focusResult.contextId };
+    }
+
+    /**
+     * Click the "Send Now" button on any queued messages if present in Antigravity.
+     * When Antigravity is running background commands or tools, submitting a message
+     * places it in Antigravity's internal "Queued Messages" list. Clicking "Send Now"
+     * forces Antigravity to steer/dispatch it to the agent immediately.
+     */
+    async clickQueuedSendNowButton(contextId?: number | null): Promise<boolean> {
+        try {
+            const expression = `(() => {
+                const btn = document.querySelector('button[aria-label="Send Now"], button[title="Send Now"]');
+                if (btn && typeof btn.click === 'function') {
+                    btn.click();
+                    return true;
+                }
+                const anyBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === 'Send Now');
+                if (anyBtn && typeof anyBtn.click === 'function') {
+                    anyBtn.click();
+                    return true;
+                }
+                return false;
+            })()`;
+            const callParams: Record<string, unknown> = { expression, returnByValue: true, awaitPromise: false };
+            if (contextId !== undefined && contextId !== null) callParams.contextId = contextId;
+            const res = await this.call('Runtime.evaluate', callParams);
+            return !!res?.result?.value;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -1473,6 +1507,10 @@ export class CdpService extends EventEmitter {
         await this.call('Input.insertText', { text });
         await new Promise(r => setTimeout(r, 200));
         await this.pressEnterToSend();
+
+        // If Antigravity placed the message into "Queued Messages", click "Send Now" to force dispatch
+        await new Promise(r => setTimeout(r, 250));
+        await this.clickQueuedSendNowButton(focusResult.contextId);
 
         // Follow the feed: pin the conversation to the newly sent turn (issue #4).
         await new Promise(r => setTimeout(r, 300));
