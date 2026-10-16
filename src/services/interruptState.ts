@@ -55,7 +55,7 @@ const pendingInterrupts = new Map<string, PendingInterrupt[]>();
 
 /**
  * Workspace keys that should bypass the busy check on their next dispatch.
- * Set when the user taps Queue or Send Now; consumed by the message handler.
+ * Set when the user taps Queue, Send anyway, or Stop & Replace; consumed by the message handler.
  */
 const bypassBusyCheck = new Set<string>();
 
@@ -156,6 +156,13 @@ export function clearPendingInterrupts(wsKey: string): void {
 // ---------------------------------------------------------------------------
 // Bypass management
 // ---------------------------------------------------------------------------
+
+/**
+ * Set bypass flag so next concurrency check allows immediate dispatch.
+ */
+export function setBypass(wsKey: string): void {
+    bypassBusyCheck.add(wsKey);
+}
 
 /**
  * Check and consume a bypass flag. Returns true if the bypass was set.
