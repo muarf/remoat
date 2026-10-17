@@ -12,6 +12,8 @@ import { PlanningDetector, PlanningInfo } from './planningDetector';
 import { QuotaService } from './quotaService';
 import { UserMessageDetector, UserMessageInfo } from './userMessageDetector';
 import { buildPlanNotificationUI } from '../ui/planUi';
+import { InteractiveQuestionDetector, InteractiveQuestionInfo } from './interactiveQuestionDetector';
+import { buildQuestionUI } from '../ui/questionUi';
 
 /** Represents a Telegram chat target: either a chat_id or chat_id + message_thread_id */
 export interface TelegramChannel {
@@ -185,11 +187,12 @@ export function parseErrorPopupCustomId(customId: string): { action: 'dismiss' |
     return null;
 }
 
-export function initCdpBridge(autoApproveDefault: boolean): CdpBridge {
+export function initCdpBridge(autoApproveDefault: boolean, display?: string): CdpBridge {
     const pool = new CdpConnectionPool({
         cdpCallTimeout: 15000,
         maxReconnectAttempts: 3,
         reconnectDelayMs: 3000,
+        display,
     });
 
     const quota = new QuotaService();
@@ -449,4 +452,71 @@ export function ensureUserMessageDetector(
     detector.start();
     bridge.pool.registerUserMessageDetector(projectName, detector);
     logger.debug(`[UserMessageDetector:${projectName}] Started`);
+}
+
+
+export function ensureQuestionDetector(
+    bridge: CdpBridge,
+    cdp: CdpService,
+    projectName: string,
+): void {
+    const existing = bridge.pool.getQuestionDetector(projectName);
+    if (existing && existing.isActive()) return;
+
+    let lastMessageId: number | null = null;
+    let lastMessageChatId: number | string | null = null;
+
+    const detector = new InteractiveQuestionDetector({
+        cdpService: cdp,
+        pollIntervalMs: 2000,
+        onResolved: () => {
+            if (!lastMessageId || !lastMessageChatId || !bridge.botApi) return;
+            const msgId = lastMessageId;
+            const chatId = lastMessageChatId;
+            lastMessageId = null;
+            lastMessageChatId = null;
+            bridge.botApi.editMessageReplyMarkup(chatId, msgId, { reply_markup: undefined })
+                .catch((e) => logger.debug('[QuestionDetector] Markup remove failed (expected if already removed):', e));
+        },
+        onQuestionRequired: async (info: InteractiveQuestionInfo) => {
+            logger.debug(`[QuestionDetector:${projectName}] Interactive question detected: "${info.title}"`);
+
+            const currentChatTitle = await getCurrentChatTitle(cdp);
+            const targetChannel = resolveApprovalChannelForCurrentChat(bridge, projectName, currentChatTitle);
+
+            if (!targetChannel || !bridge.botApi) return;
+
+            // Check auto-accept if this is a permission prompt
+            const isPermission =
+                info.title.toLowerCase().includes('permission') ||
+                info.title.toLowerCase().includes('mcp') ||
+                info.title.toLowerCase().includes('allow');
+
+            if (isPermission && bridge.autoAccept.isEnabled()) {
+                const allowOpt = info.options.find(
+                    (opt) => /allow|yes|always/i.test(opt.text) && !/never|deny|no\b/i.test(opt.text)
+                );
+                if (allowOpt) {
+                    const submitted = await detector.selectAndSubmit(allowOpt.id);
+                    if (submitted) {
+                        const targetTool = info.subtitle ? ` (${info.subtitle})` : '';
+                        const text = `✅ <b>Auto-approved Permission</b>\nAllowed tool: <code>${escapeHtml(targetTool || info.title)}</code>\n<b>Option:</b> ${escapeHtml(allowOpt.text)}\n<b>Workspace:</b> ${escapeHtml(projectName)}`;
+                        await sendTelegramMessage(bridge.botApi, targetChannel, text);
+                        return;
+                    }
+                }
+            }
+
+            const { text, keyboard } = buildQuestionUI(info, projectName);
+            const msgId = await sendTelegramMessage(bridge.botApi, targetChannel, text, keyboard);
+            if (msgId) {
+                lastMessageId = msgId;
+                lastMessageChatId = targetChannel.chatId;
+            }
+        },
+    });
+
+    detector.start();
+    bridge.pool.registerQuestionDetector(projectName, detector);
+    logger.debug(`[QuestionDetector:${projectName}] Started`);
 }

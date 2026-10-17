@@ -74,6 +74,15 @@ export class PromptDispatcher {
         return busy;
     }
 
+    /**
+     * Forcibly clear locks for a workspace/channel (e.g. when stopping and replacing a task).
+     */
+    resetWorkspaceLock(lockKey: string): void {
+        this.workspaceLocks.delete(lockKey);
+        this.channelLocks.delete(lockKey);
+        logger.info(`[PromptDispatcher] Reset lock for ${lockKey}`);
+    }
+
     async send(req: PromptDispatchRequest): Promise<void> {
         const chKey = this.channelKey(req.channel);
         const wsName = req.cdp.getCurrentWorkspaceName();

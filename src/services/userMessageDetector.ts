@@ -34,25 +34,23 @@ export interface UserMessageDetectorOptions {
  *     </div>
  *   </div>
  */
-const DETECT_USER_MESSAGE_SCRIPT = `(() => {
+export const DETECT_USER_MESSAGE_SCRIPT = `(() => {
     const panel = document.querySelector('.antigravity-agent-side-panel');
     const scope = panel || document;
 
-    // Strategy A (primary): Query .whitespace-pre-wrap elements directly inside
-    // user bubble containers. This avoids the parent-container problem where
-    // querySelectorAll matches a wrapper that contains multiple bubbles.
-    const textEls = scope.querySelectorAll(
-        '[class*="bg-gray-500/15"][class*="select-text"] .whitespace-pre-wrap'
-    );
+    // Strategy 1 (modern Antigravity 2.0):
+    // User bubbles are wrapped in card-border elements containing .whitespace-pre-wrap
+    const modernTextEls = Array.from(scope.querySelectorAll(
+        '.bg-card-border .whitespace-pre-wrap, [class*="bg-card"] .whitespace-pre-wrap, [class*="bg-gray-500/15"] .whitespace-pre-wrap'
+    ));
 
-    if (textEls.length > 0) {
-        const lastTextEl = textEls[textEls.length - 1];
-        const text = (lastTextEl.textContent || '').trim();
+    if (modernTextEls.length > 0) {
+        const last = modernTextEls[modernTextEls.length - 1];
+        const text = (last.textContent || '').trim();
         if (text.length > 0) return { text };
     }
 
-    // Strategy B (fallback): Find individual bubble containers, filtering out
-    // any element that itself contains nested bubble elements (i.e., a parent wrapper).
+    // Strategy 2 (fallback): Find individual bubble containers
     const userBubbles = Array.from(scope.querySelectorAll(
         '[class*="bg-gray-500/15"][class*="rounded-lg"][class*="select-text"]'
     )).filter(el => !el.querySelector('[class*="bg-gray-500/15"][class*="select-text"]'));
@@ -151,6 +149,11 @@ export class UserMessageDetector {
     /** Returns whether monitoring is currently active. */
     isActive(): boolean {
         return this.isRunning;
+    }
+
+    /** Check user message once (for manual poll and tests). */
+    async checkUserMessage(): Promise<void> {
+        await this.poll();
     }
 
     /** Add a hash to the seenHashes set, evicting the oldest entry if at capacity. */
