@@ -32,6 +32,7 @@ import {
     ensureApprovalDetector,
     ensureErrorPopupDetector,
     ensurePlanningDetector,
+    ensureQuestionDetector,
     getCurrentCdp,
     initCdpBridge,
     registerApprovalSessionChannel,
@@ -68,6 +69,10 @@ import {
     PLAN_VIEW_BTN, PLAN_PROCEED_BTN, PLAN_EDIT_BTN, PLAN_REFRESH_BTN, PLAN_PAGE_PREFIX,
     buildPlanNotificationUI, buildPlanContentUI, paginatePlanContent,
 } from '../ui/planUi';
+import {
+    QUESTION_OPT_PREFIX,
+    QUESTION_SKIP_PREFIX,
+} from '../ui/questionUi';
 import {
     INTERRUPT_QUEUE_PREFIX, INTERRUPT_STEER_PREFIX, INTERRUPT_STOP_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
     buildInterruptUI, safeCallbackKey,
@@ -982,6 +987,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 ensureApprovalDetector(bridge, cdp, projectName);
                 ensureErrorPopupDetector(bridge, cdp, projectName);
                 ensurePlanningDetector(bridge, cdp, projectName);
+                ensureQuestionDetector(bridge, cdp, projectName);
             },
         });
 
@@ -1669,6 +1675,56 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const { text: pageText, keyboard: pageKeyboard } = buildPlanContentUI(pages, page, projectName, targetChannelStr || String(ch.chatId), lastInfo?.planTitle ?? undefined, lastInfo?.proceedText ?? undefined);
             try { await ctx.editMessageText(pageText, { parse_mode: 'HTML', reply_markup: pageKeyboard }); } catch (e) { logger.debug('[editMsg] Telegram edit failed (expected for unmodified):', e); }
             await ctx.answerCallbackQuery({ text: `Page ${page + 1}/${pages.length}` });
+            return;
+        }
+
+        // Interactive question & MCP permission buttons
+        if (data.startsWith(QUESTION_OPT_PREFIX)) {
+            const rest = data.substring(QUESTION_OPT_PREFIX.length);
+            const colonIdx = rest.indexOf(':');
+            if (colonIdx !== -1) {
+                const projectKey = rest.substring(0, colonIdx);
+                const optId = rest.substring(colonIdx + 1);
+                const detector = bridge.pool.getQuestionDetector(projectKey) ||
+                                 (bridge.lastActiveWorkspace ? bridge.pool.getQuestionDetector(bridge.lastActiveWorkspace) : undefined);
+                if (!detector) {
+                    await ctx.answerCallbackQuery({ text: 'Question detector not found.' });
+                    return;
+                }
+                const success = await detector.selectAndSubmit(optId);
+                if (success) {
+                    await ctx.answerCallbackQuery({ text: 'Option submitted!' });
+                    try {
+                        await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+                    } catch (e) {
+                        logger.debug('[questionOpt] Failed to clear markup:', e);
+                    }
+                } else {
+                    await ctx.answerCallbackQuery({ text: 'Failed to submit option in IDE.' });
+                }
+                return;
+            }
+        }
+
+        if (data.startsWith(QUESTION_SKIP_PREFIX)) {
+            const projectKey = data.substring(QUESTION_SKIP_PREFIX.length);
+            const detector = bridge.pool.getQuestionDetector(projectKey) ||
+                             (bridge.lastActiveWorkspace ? bridge.pool.getQuestionDetector(bridge.lastActiveWorkspace) : undefined);
+            if (!detector) {
+                await ctx.answerCallbackQuery({ text: 'Question detector not found.' });
+                return;
+            }
+            const success = await detector.skip();
+            if (success) {
+                await ctx.answerCallbackQuery({ text: 'Skipped!' });
+                try {
+                    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+                } catch (e) {
+                    logger.debug('[questionSkip] Failed to clear markup:', e);
+                }
+            } else {
+                await ctx.answerCallbackQuery({ text: 'Skip button not found in IDE.' });
+            }
             return;
         }
 
