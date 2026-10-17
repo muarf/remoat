@@ -22,6 +22,7 @@ import { TitleGeneratorService } from '../services/titleGeneratorService';
 import { CdpService } from '../services/cdpService';
 import { ChatSessionService } from '../services/chatSessionService';
 import { ResponseMonitor, RESPONSE_SELECTORS } from '../services/responseMonitor';
+import { UserMessageInfo } from '../services/userMessageDetector';
 import { ensureAntigravityRunning } from '../services/antigravityLauncher';
 import { getAntigravityCdpHint } from '../utils/pathUtils';
 import { AutoAcceptService } from '../services/autoAcceptService';
@@ -33,7 +34,10 @@ import {
     ensureErrorPopupDetector,
     ensurePlanningDetector,
     ensureQuestionDetector,
+    ensureUserMessageDetector,
     getCurrentCdp,
+    getCurrentChatTitle,
+    resolveApprovalChannelForCurrentChat,
     initCdpBridge,
     registerApprovalSessionChannel,
     registerApprovalWorkspaceChannel,
@@ -988,8 +992,161 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 ensureErrorPopupDetector(bridge, cdp, projectName);
                 ensurePlanningDetector(bridge, cdp, projectName);
                 ensureQuestionDetector(bridge, cdp, projectName);
+                ensureUserMessageDetector(bridge, cdp, projectName, (info) => {
+                    handleExternalUserMessage(projectName, cdp, info).catch((err) => {
+                        logger.error(`[ExternalMessage:${projectName}] Handling failed:`, err);
+                    });
+                });
             },
         });
+
+    // Helper to parse stored channel key
+    const parseStoredChannelKey = (key: string): TelegramChannel => {
+        const parts = key.split(':');
+        if (parts.length === 2 && !isNaN(Number(parts[1]))) {
+            return { chatId: parts[0], threadId: Number(parts[1]) };
+        }
+        return { chatId: key };
+    };
+
+    // Handle messages typed directly into Antigravity IDE (e.g. from VNC / Desktop)
+    const handleExternalUserMessage = async (projectName: string, cdp: CdpService, info: UserMessageInfo) => {
+        logger.info(`[ExternalMessage:${projectName}] Detected message from IDE: "${info.text.slice(0, 50)}..."`);
+        const currentChatTitle = await getCurrentChatTitle(cdp);
+        let targetChannel = resolveApprovalChannelForCurrentChat(bridge, projectName, currentChatTitle)
+            || bridge.approvalChannelByWorkspace.get(projectName);
+
+        if (!targetChannel) {
+            // Fallback: look up in workspaceBindingRepo
+            const binding = workspaceBindingRepo.findAll().find(b => b.workspacePath === projectName);
+            if (binding) {
+                targetChannel = parseStoredChannelKey(binding.channelId);
+                registerApprovalWorkspaceChannel(bridge, projectName, targetChannel);
+            }
+        }
+
+        if (!targetChannel) {
+            logger.warn(`[ExternalMessage:${projectName}] No target channel found for external message.`);
+            return;
+        }
+
+        // 1. Notify Telegram of the message typed in IDE
+        try {
+            await bot.api.sendMessage(
+                targetChannel.chatId,
+                `👤 <b>Message from IDE (${escapeHtml(projectName)})</b>\n\n<i>${escapeHtml(info.text)}</i>`,
+                { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+            );
+        } catch (err) {
+            logger.error(`[ExternalMessage:${projectName}] Failed to post message notice:`, err);
+        }
+
+        // 2. Attach ResponseMonitor to relay assistant's generation
+        let statusMsgId: number | null = null;
+        try {
+            const statusMsg = await bot.api.sendMessage(
+                targetChannel.chatId,
+                `💭 <i>Thinking in ${escapeHtml(projectName)}...</i>`,
+                { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+            );
+            statusMsgId = statusMsg.message_id;
+        } catch (e) {
+            logger.debug(`[ExternalMessage:${projectName}] Failed to post status:`, e);
+        }
+
+        const monitor = new ResponseMonitor({
+            cdpService: cdp,
+            pollIntervalMs: 2000,
+            extractionMode: config.extractionMode,
+            onComplete: async (finalText, meta) => {
+                logger.info(`[ExternalMessage:${projectName}] Response complete (length=${finalText.length})`);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+
+                let freshText = '';
+                let freshIsHtml = false;
+                try {
+                    const contextId = cdp.getPrimaryContextId();
+                    const evalParams: Record<string, unknown> = {
+                        expression: extractAssistantSegmentsPayloadScript(),
+                        returnByValue: true,
+                        awaitPromise: true,
+                    };
+                    if (contextId !== null && contextId !== undefined) evalParams.contextId = contextId;
+                    const freshResult = await cdp.call('Runtime.evaluate', evalParams);
+                    const freshClassified = classifyAssistantSegments(freshResult?.result?.value);
+                    if (freshClassified.diagnostics.source === 'dom-structured' && freshClassified.finalOutputText.trim()) {
+                        freshText = freshClassified.finalOutputText.trim();
+                        freshIsHtml = true;
+                    }
+                } catch (e) {
+                    logger.debug('[ExternalMessage] Fresh structured extraction failed:', e);
+                }
+
+                const responseText = (freshText && freshText.length >= finalText.length)
+                    ? freshText
+                    : (finalText || '');
+
+                if (!responseText || !responseText.trim() || !targetChannel) return;
+
+                const isHtml = freshIsHtml || meta?.source === 'structured';
+                const formatted = isHtml ? responseText : formatForTelegram(responseText);
+
+                const chunks = splitTelegramHtml(formatted, 4000);
+                for (const chunk of chunks) {
+                    try {
+                        await bot.api.sendMessage(
+                            targetChannel.chatId,
+                            chunk,
+                            { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+                        );
+                    } catch (err) {
+                        logger.error(`[ExternalMessage:${projectName}] Failed to send chunk:`, err);
+                    }
+                }
+            },
+            onTimeout: async () => {
+                logger.warn(`[ExternalMessage:${projectName}] ResponseMonitor timed out`);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+            },
+        });
+
+        monitor.start();
+    };
+
+    // Auto-discover and connect already open Antigravity workspaces
+    const autoConnectOpenWorkspaces = async () => {
+        try {
+            const bindings = workspaceBindingRepo.findAll();
+            if (bindings.length === 0) return;
+
+            const res = await fetch('http://127.0.0.1:9223/json').catch(() => null);
+            if (!res || !res.ok) return;
+            const targets = await res.json() as Array<{ type: string; title: string }>;
+            const pageTitles = targets.filter(t => t.type === 'page').map(t => t.title.toLowerCase());
+
+            for (const binding of bindings) {
+                const wsName = binding.workspacePath;
+                const isPageOpen = pageTitles.some(title => title.includes(wsName.toLowerCase()));
+                if (isPageOpen && !bridge.pool.getConnected(wsName)) {
+                    const ch = parseStoredChannelKey(binding.channelId);
+                    logger.info(`[AutoConnect] Connecting open workspace "${wsName}" to channel ${binding.channelId}`);
+                    await resolveWorkspaceAndCdp(ch).catch((e) => {
+                        logger.debug(`[AutoConnect] Failed to connect "${wsName}":`, e);
+                    });
+                }
+            }
+        } catch (e) {
+            logger.debug('[AutoConnect] Discovery cycle failed:', e);
+        }
+    };
 
     const replyHtml = async (ctx: Context, text: string, keyboard?: InlineKeyboard) => {
         await ctx.reply(text, {
@@ -2313,6 +2470,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     { command: 'ping', description: 'Check latency' },
                 ]);
                 logger.info('Telegram command menu registered successfully');
+                setTimeout(autoConnectOpenWorkspaces, 1000);
+                setInterval(autoConnectOpenWorkspaces, 15000);
             } catch (err) {
                 logger.error('Failed to register command menu:', err);
             }
