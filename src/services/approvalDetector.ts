@@ -29,7 +29,7 @@ export interface ApprovalDetectorOptions {
  *
  * Detects allow/deny button pairs and extracts descriptions with fallbacks.
  */
-const DETECT_APPROVAL_SCRIPT = `(() => {
+export const DETECT_APPROVAL_SCRIPT = `(() => {
     const ALLOW_ONCE_PATTERNS = ['allow once', 'allow one time', '今回のみ許可', '1回のみ許可', '一度許可'];
     const ALWAYS_ALLOW_PATTERNS = [
         'allow this conversation',
@@ -43,45 +43,76 @@ const DETECT_APPROVAL_SCRIPT = `(() => {
 
     const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
 
+    // Buttons indicating command execution status or completed history — NEVER approval prompts
+    const isExecutionStatus = (t) => {
+        return /^(ran|running)(\\s|$)/i.test(t);
+    };
+
+    const matchesAllowPattern = (text, pattern) => {
+        // "run" and "execute" are common substrings in CLI tools (e.g. gh run, npm run, cargo run).
+        // Only treat as approval button when it represents the action verb itself, not an arbitrary shell command.
+        if (pattern === 'run' || pattern === 'execute') {
+            return /^(run|execute)(\\s+(command|tool|action|script|all))?$/i.test(text);
+        }
+        if (/^[a-zA-Z]+$/.test(pattern)) {
+            return new RegExp('(^|\\\\s)' + pattern + '(\\\\s|$)', 'i').test(text);
+        }
+        return text.includes(pattern);
+    };
+
+    const matchesDenyPattern = (text, pattern) => {
+        if (/^[a-zA-Z]+$/.test(pattern)) {
+            return new RegExp('(^|\\\\s)' + pattern + '(\\\\s|$)', 'i').test(text);
+        }
+        return text.includes(pattern);
+    };
+
     const allButtons = Array.from(document.querySelectorAll('button'))
         .filter(btn => btn.offsetParent !== null);
 
     let approveBtn = allButtons.find(btn => {
         const t = normalize(btn.textContent || '');
+        if (isExecutionStatus(t)) return false;
         return ALLOW_ONCE_PATTERNS.some(p => t.includes(p));
     }) || null;
 
     if (!approveBtn) {
         approveBtn = allButtons.find(btn => {
             const t = normalize(btn.textContent || '');
+            if (isExecutionStatus(t)) return false;
             const isAlways = ALWAYS_ALLOW_PATTERNS.some(p => t.includes(p));
-            return !isAlways && ALLOW_PATTERNS.some(p => t.includes(p));
+            return !isAlways && ALLOW_PATTERNS.some(p => matchesAllowPattern(t, p));
         }) || null;
     }
 
     if (!approveBtn) return null;
 
-    let container = approveBtn.closest('[role="dialog"], .modal, .dialog, .approval-container, .permission-dialog');
+    let container = approveBtn.closest('[role="dialog"], [role="alertdialog"], .modal, .dialog, .approval-container, .permission-dialog');
     if (!container) {
-        // Walk up ancestors until we find one that also contains a deny button
+        // Walk up ancestors until we find one that also contains a deny button (max 6 levels)
         let el = approveBtn.parentElement;
         for (let i = 0; i < 6 && el && el !== document.body; i++) {
-            const btns = Array.from(el.querySelectorAll('button')).filter(b => b.offsetParent !== null);
-            if (btns.some(b => DENY_PATTERNS.some(p => normalize(b.textContent || '').includes(p)))) {
+            const btns = Array.from(el.querySelectorAll('button')).filter(b => b.offsetParent !== null && b !== approveBtn);
+            if (btns.some(b => {
+                const t = normalize(b.textContent || '');
+                return !isExecutionStatus(t) && DENY_PATTERNS.some(p => matchesDenyPattern(t, p));
+            })) {
                 container = el;
                 break;
             }
             el = el.parentElement;
         }
     }
-    if (!container) container = document.body;
+    // Never fall back to document.body; an approval prompt MUST be contained in a dialog or shared parent
+    if (!container || container === document.body) return null;
 
     const containerButtons = Array.from(container.querySelectorAll('button'))
-        .filter(btn => btn.offsetParent !== null);
+        .filter(btn => btn.offsetParent !== null && btn !== approveBtn);
 
     const denyBtn = containerButtons.find(btn => {
         const t = normalize(btn.textContent || '');
-        return DENY_PATTERNS.some(p => t.includes(p));
+        if (isExecutionStatus(t)) return false;
+        return DENY_PATTERNS.some(p => matchesDenyPattern(t, p));
     }) || null;
 
     if (!denyBtn) return null;
@@ -98,26 +129,20 @@ const DETECT_APPROVAL_SCRIPT = `(() => {
     // Description extraction (multiple fallbacks)
     let description = '';
 
-    // 1. p or .description inside dialog/modal
-    const dialog = container;
-    if (dialog) {
-        const descEl = dialog.querySelector('p, .description, [data-testid="description"]');
-        if (descEl) {
-            description = (descEl.textContent || '').trim();
-        }
+    // 1. p, .description or [data-testid="description"] inside dialog/container (excluding buttons)
+    const descEl = container.querySelector('p, .description, [data-testid="description"], .permission-message');
+    if (descEl && !descEl.closest('button')) {
+        description = (descEl.textContent || '').trim();
     }
 
     // 2. Parent element text (excluding button text)
-    if (!description) {
-        const parent = approveBtn.parentElement?.parentElement || approveBtn.parentElement;
-        if (parent) {
-            const clone = parent.cloneNode(true);
-            const buttons = clone.querySelectorAll('button');
-            buttons.forEach(b => b.remove());
-            const parentText = (clone.textContent || '').trim();
-            if (parentText.length > 5 && parentText.length < 500) {
-                description = parentText;
-            }
+    if (!description && container !== document.body) {
+        const clone = container.cloneNode(true);
+        const buttons = clone.querySelectorAll('button');
+        buttons.forEach(b => b.remove());
+        const parentText = (clone.textContent || '').trim();
+        if (parentText.length > 5 && parentText.length < 500) {
+            description = parentText;
         }
     }
 
@@ -319,8 +344,10 @@ export class ApprovalDetector {
             const info: ApprovalInfo | null = result?.result?.value ?? null;
 
             if (info) {
-                // Duplicate prevention: use approveText + description combination as key
-                const key = `${info.approveText}::${info.description}`;
+                // Duplicate prevention: normalize approveText to strip dynamic numbers/counters
+                // (e.g. "Running 7 commands" -> "Running commands") to prevent thrashing
+                const normalizedApproveText = info.approveText.replace(/\d+/g, '').trim();
+                const key = `${normalizedApproveText}::${info.description}`;
                 if (key !== this.lastDetectedKey) {
                     this.lastDetectedKey = key;
                     this.lastDetectedInfo = info;

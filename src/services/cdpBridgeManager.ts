@@ -253,6 +253,8 @@ export function ensureApprovalDetector(
 
     let lastMessageId: number | null = null;
     let lastMessageChatId: number | string | null = null;
+    let lastNotificationTime = 0;
+    const NOTIFICATION_COOLDOWN_MS = 2500;
 
     const detector = new ApprovalDetector({
         cdpService: cdp,
@@ -267,6 +269,13 @@ export function ensureApprovalDetector(
                 .catch((e) => logger.debug('[ApprovalDetector] Markup remove failed (expected if already removed):', e));
         },
         onApprovalRequired: async (info: ApprovalInfo) => {
+            const now = Date.now();
+            if (now - lastNotificationTime < NOTIFICATION_COOLDOWN_MS) {
+                logger.debug(`[ApprovalDetector:${projectName}] Throttled rapid notification (< ${NOTIFICATION_COOLDOWN_MS}ms)`);
+                return;
+            }
+            lastNotificationTime = now;
+
             logger.debug(`[ApprovalDetector:${projectName}] Approval detected`);
 
             const currentChatTitle = await getCurrentChatTitle(cdp);
