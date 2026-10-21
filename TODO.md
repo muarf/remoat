@@ -15,15 +15,18 @@
   - [x] Ignorer `npm run build` et `cargo run --release`
   - [x] Conserver la détection des vraies approbations (`Allow Once`, `Allow this conversation`, `Deny`, `Run` bouton d'approbation).
 - [x] Valider avec `npm test` (79 test suites, 907 tests passés) et `npm run build` (tsc 0 erreur).
-- [ ] Déployer le nouveau build sur la session `screen` en local.
-- [ ] Commiter sur la branche `fix/approval-detector-false-positives`.
+- [x] Déployer le nouveau build sur la session `screen` en local.
+- [x] Commiter sur la branche `fix/approval-detector-false-positives`.
 
 ---
 
 ## Roadmap / Améliorations futures
 
-- [ ] **Détection de fin de réponse autonome (Antigravity System Events)** :
-  - Écouter l'indicateur d'activité global d'Antigravity (`Thinking...`) pour attacher automatiquement un `ResponseMonitor` lorsque l'agent reprend de façon autonome (fin d'une tâche de fond, notification système, timer).
+- [x] **Détection de fin de réponse autonome (Antigravity System Events / Background Tasks)** :
+  - [x] Service `AutonomousActivityDetector` détectant la reprise spontanée de l'agent (`isGenerating`, stop button, nouveaux tours assistant sans message utilisateur).
+  - [x] Intégration dans `cdpConnectionPool` et `cdpBridgeManager`.
+  - [x] Liaison dans `src/bot/index.ts` avec attachement dynamique de `ResponseMonitor` et relais Telegram.
+  - [x] Suite de tests unitaires dédiée (`tests/services/autonomousActivityDetector.test.ts`, 5/5 passés).
 - [ ] **Commandes avancées** :
   - [ ] Commande `/plan` dans Telegram pour déclencher le mode planification / génération de plan structuré.
   - [ ] Commande `/grill-me` pour cadrage interactif des exigences.

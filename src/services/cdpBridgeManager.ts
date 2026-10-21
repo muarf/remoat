@@ -14,6 +14,7 @@ import { UserMessageDetector, UserMessageInfo } from './userMessageDetector';
 import { buildPlanNotificationUI } from '../ui/planUi';
 import { InteractiveQuestionDetector, InteractiveQuestionInfo } from './interactiveQuestionDetector';
 import { buildQuestionUI } from '../ui/questionUi';
+import { AutonomousActivityDetector } from './autonomousActivityDetector';
 
 /** Represents a Telegram chat target: either a chat_id or chat_id + message_thread_id */
 export interface TelegramChannel {
@@ -461,6 +462,30 @@ export function ensureUserMessageDetector(
     detector.start();
     bridge.pool.registerUserMessageDetector(projectName, detector);
     logger.debug(`[UserMessageDetector:${projectName}] Started`);
+}
+
+export function ensureAutonomousActivityDetector(
+    bridge: CdpBridge,
+    cdp: CdpService,
+    projectName: string,
+    isMonitored: () => boolean,
+    onAutonomousStart?: () => Promise<void> | void,
+    onAutonomousResponse?: (info: { preview: string; length: number }) => Promise<void> | void,
+): void {
+    const existing = bridge.pool.getAutonomousDetector(projectName);
+    if (existing && existing.isActive()) return;
+
+    const detector = new AutonomousActivityDetector({
+        cdpService: cdp,
+        pollIntervalMs: 2000,
+        isMonitored,
+        onAutonomousStart,
+        onAutonomousResponse,
+    });
+
+    detector.start();
+    bridge.pool.registerAutonomousDetector(projectName, detector);
+    logger.debug(`[AutonomousActivityDetector:${projectName}] Started`);
 }
 
 

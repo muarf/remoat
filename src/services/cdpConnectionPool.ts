@@ -8,6 +8,7 @@ import { ErrorPopupDetector } from './errorPopupDetector';
 import { PlanningDetector } from './planningDetector';
 import { UserMessageDetector } from './userMessageDetector';
 import { InteractiveQuestionDetector } from './interactiveQuestionDetector';
+import { AutonomousActivityDetector } from './autonomousActivityDetector';
 
 /**
  * Pool that manages independent CdpService instances per workspace.
@@ -28,6 +29,7 @@ export class CdpConnectionPool extends EventEmitter {
     private readonly planningDetectors = new Map<string, PlanningDetector>();
     private readonly userMessageDetectors = new Map<string, UserMessageDetector>();
     private readonly questionDetectors = new Map<string, InteractiveQuestionDetector>();
+    private readonly autonomousDetectors = new Map<string, AutonomousActivityDetector>();
     private readonly connectingPromises = new Map<string, Promise<CdpService>>();
     private readonly cdpOptions: CdpServiceOptions;
 
@@ -136,6 +138,12 @@ export class CdpConnectionPool extends EventEmitter {
         if (questionDetector) {
             questionDetector.stop();
             this.questionDetectors.delete(projectName);
+        }
+
+        const autonomousDetector = this.autonomousDetectors.get(projectName);
+        if (autonomousDetector) {
+            autonomousDetector.stop();
+            this.autonomousDetectors.delete(projectName);
         }
     }
 
@@ -261,6 +269,24 @@ export class CdpConnectionPool extends EventEmitter {
             }
         }
         return undefined;
+    }
+
+    /**
+     * Register an autonomous activity detector for a workspace.
+     */
+    registerAutonomousDetector(projectName: string, detector: AutonomousActivityDetector): void {
+        const existing = this.autonomousDetectors.get(projectName);
+        if (existing && existing.isActive()) {
+            existing.stop();
+        }
+        this.autonomousDetectors.set(projectName, detector);
+    }
+
+    /**
+     * Get the autonomous activity detector for a workspace.
+     */
+    getAutonomousDetector(projectName: string): AutonomousActivityDetector | undefined {
+        return this.autonomousDetectors.get(projectName);
     }
 
     /**

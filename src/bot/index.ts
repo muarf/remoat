@@ -35,6 +35,7 @@ import {
     ensurePlanningDetector,
     ensureQuestionDetector,
     ensureUserMessageDetector,
+    ensureAutonomousActivityDetector,
     getCurrentCdp,
     getCurrentChatTitle,
     resolveApprovalChannelForCurrentChat,
@@ -167,6 +168,9 @@ function createSerialTaskQueue(queueName: string, traceId: string): (task: () =>
         return queue;
     };
 }
+
+/** Set of workspace names currently being actively monitored by a ResponseMonitor */
+export const activeMonitorsByWorkspace = new Set<string>();
 
 async function sendPromptToAntigravity(
     bridge: CdpBridge,
@@ -490,6 +494,7 @@ async function sendPromptToAntigravity(
         // fires on NEW artifacts from the upcoming response (not old session artifacts).
         const projectName = cdp.getCurrentWorkspaceName() || bridge.lastActiveWorkspace;
         if (projectName) {
+            activeMonitorsByWorkspace.add(projectName);
             const detector = bridge.pool.getPlanningDetector(projectName);
             if (detector) {
                 await detector.resetBaseline().catch((err: Error) =>
@@ -765,6 +770,12 @@ async function sendPromptToAntigravity(
                     if (finalOutputText && finalOutputText.trim().length > 0) {
                         const footer = `⏱️ ${elapsed}s`;
                         await sendChunkedResponse('', footer, finalOutputText, isAlreadyHtml);
+                        if (projectName) {
+                            const autoDetector = bridge.pool.getAutonomousDetector(projectName);
+                            if (autoDetector) {
+                                autoDetector.addSeenText(finalOutputText);
+                            }
+                        }
                     } else {
                         await upsertLiveResponse(`${PHASE_ICONS.complete} Complete`, t('Failed to extract response. Use /screenshot to verify.'), `⏱️ ${elapsed}s`, { expectedVersion: liveResponseUpdateVersion });
                     }
@@ -842,6 +853,11 @@ async function sendPromptToAntigravity(
         if (monitor) { await monitor.stop().catch(() => {}); }
         resolveMonitorDone();
         await sendEmbed(`${PHASE_ICONS.error} Error`, t(`Error occurred during processing: ${e.message}`));
+    } finally {
+        const projectName = cdp.getCurrentWorkspaceName() || bridge.lastActiveWorkspace;
+        if (projectName) {
+            activeMonitorsByWorkspace.delete(projectName);
+        }
     }
 }
 
@@ -997,6 +1013,22 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                         logger.error(`[ExternalMessage:${projectName}] Handling failed:`, err);
                     });
                 });
+                ensureAutonomousActivityDetector(
+                    bridge,
+                    cdp,
+                    projectName,
+                    () => activeMonitorsByWorkspace.has(projectName) || promptDispatcher.isBusy(channel, cdp),
+                    () => {
+                        handleAutonomousActivity(projectName, cdp, 'start').catch((err) => {
+                            logger.error(`[AutonomousActivity:${projectName}] Start handling failed:`, err);
+                        });
+                    },
+                    (info) => {
+                        handleAutonomousActivity(projectName, cdp, 'completed', info).catch((err) => {
+                            logger.error(`[AutonomousActivity:${projectName}] Complete handling failed:`, err);
+                        });
+                    },
+                );
             },
         });
 
@@ -1041,6 +1073,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             logger.error(`[ExternalMessage:${projectName}] Failed to post message notice:`, err);
         }
 
+        activeMonitorsByWorkspace.add(projectName);
+
         // 2. Attach ResponseMonitor to relay assistant's generation
         let statusMsgId: number | null = null;
         try {
@@ -1060,6 +1094,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             extractionMode: config.extractionMode,
             onComplete: async (finalText, meta) => {
                 logger.info(`[ExternalMessage:${projectName}] Response complete (length=${finalText.length})`);
+                activeMonitorsByWorkspace.delete(projectName);
                 if (statusMsgId && targetChannel) {
                     try {
                         await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
@@ -1092,6 +1127,11 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
                 if (!responseText || !responseText.trim() || !targetChannel) return;
 
+                const autoDetector = bridge.pool.getAutonomousDetector(projectName);
+                if (autoDetector) {
+                    autoDetector.addSeenText(responseText);
+                }
+
                 const isHtml = freshIsHtml || meta?.source === 'structured';
                 const formatted = isHtml ? responseText : formatForTelegram(responseText);
 
@@ -1110,6 +1150,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             },
             onTimeout: async () => {
                 logger.warn(`[ExternalMessage:${projectName}] ResponseMonitor timed out`);
+                activeMonitorsByWorkspace.delete(projectName);
                 if (statusMsgId && targetChannel) {
                     try {
                         await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
@@ -1118,7 +1159,139 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             },
         });
 
-        monitor.start();
+        monitor.start().catch((err) => {
+            activeMonitorsByWorkspace.delete(projectName);
+            logger.error(`[ExternalMessage:${projectName}] Failed to start ResponseMonitor:`, err);
+        });
+    };
+
+    // Handle autonomous agent activity (background tasks, timers, reactive wakeup)
+    const handleAutonomousActivity = async (
+        projectName: string,
+        cdp: CdpService,
+        mode: 'start' | 'completed',
+        completedInfo?: { preview: string; length: number },
+    ) => {
+        if (activeMonitorsByWorkspace.has(projectName)) {
+            logger.debug(`[AutonomousActivity:${projectName}] Already monitored, skipping`);
+            return;
+        }
+
+        const currentChatTitle = await getCurrentChatTitle(cdp);
+        let targetChannel = resolveApprovalChannelForCurrentChat(bridge, projectName, currentChatTitle)
+            || bridge.approvalChannelByWorkspace.get(projectName);
+
+        if (!targetChannel) {
+            const binding = workspaceBindingRepo.findAll().find(b => b.workspacePath === projectName);
+            if (binding) {
+                targetChannel = parseStoredChannelKey(binding.channelId);
+                registerApprovalWorkspaceChannel(bridge, projectName, targetChannel);
+            }
+        }
+
+        if (!targetChannel) {
+            logger.warn(`[AutonomousActivity:${projectName}] No target channel found for autonomous activity.`);
+            return;
+        }
+
+        const sendResponseToTelegram = async (finalText: string, meta?: any) => {
+            let freshText = '';
+            let freshIsHtml = false;
+            try {
+                const contextId = cdp.getPrimaryContextId();
+                const evalParams: Record<string, unknown> = {
+                    expression: extractAssistantSegmentsPayloadScript(),
+                    returnByValue: true,
+                    awaitPromise: true,
+                };
+                if (contextId !== null && contextId !== undefined) evalParams.contextId = contextId;
+                const freshResult = await cdp.call('Runtime.evaluate', evalParams);
+                const freshClassified = classifyAssistantSegments(freshResult?.result?.value);
+                if (freshClassified.diagnostics.source === 'dom-structured' && freshClassified.finalOutputText.trim()) {
+                    freshText = freshClassified.finalOutputText.trim();
+                    freshIsHtml = true;
+                }
+            } catch (e) {
+                logger.debug(`[AutonomousActivity:${projectName}] Fresh structured extraction failed:`, e);
+            }
+
+            const responseText = (freshText && freshText.length >= finalText.length)
+                ? freshText
+                : (finalText || '');
+
+            if (!responseText || !responseText.trim() || !targetChannel) return;
+
+            const autoDetector = bridge.pool.getAutonomousDetector(projectName);
+            if (autoDetector) {
+                autoDetector.addSeenText(responseText);
+            }
+
+            const isHtml = freshIsHtml || meta?.source === 'structured';
+            const formatted = isHtml ? responseText : formatForTelegram(responseText);
+
+            const chunks = splitTelegramHtml(formatted, 4000);
+            for (const chunk of chunks) {
+                try {
+                    await bot.api.sendMessage(
+                        targetChannel.chatId,
+                        chunk,
+                        { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+                    );
+                } catch (err) {
+                    logger.error(`[AutonomousActivity:${projectName}] Failed to send chunk:`, err);
+                }
+            }
+        };
+
+        if (mode === 'completed') {
+            logger.info(`[AutonomousActivity:${projectName}] Relaying completed autonomous response`);
+            await sendResponseToTelegram(completedInfo?.preview ?? '');
+            return;
+        }
+
+        activeMonitorsByWorkspace.add(projectName);
+
+        let statusMsgId: number | null = null;
+        try {
+            const statusMsg = await bot.api.sendMessage(
+                targetChannel.chatId,
+                `💭 <i>Agent active in ${escapeHtml(projectName)}...</i>`,
+                { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+            );
+            statusMsgId = statusMsg.message_id;
+        } catch (e) {
+            logger.debug(`[AutonomousActivity:${projectName}] Failed to post status:`, e);
+        }
+
+        const monitor = new ResponseMonitor({
+            cdpService: cdp,
+            pollIntervalMs: 2000,
+            extractionMode: config.extractionMode,
+            onComplete: async (finalText, meta) => {
+                logger.info(`[AutonomousActivity:${projectName}] Response complete (length=${finalText.length})`);
+                activeMonitorsByWorkspace.delete(projectName);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+                await sendResponseToTelegram(finalText, meta);
+            },
+            onTimeout: async () => {
+                logger.warn(`[AutonomousActivity:${projectName}] ResponseMonitor timed out`);
+                activeMonitorsByWorkspace.delete(projectName);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+            },
+        });
+
+        monitor.start().catch((err) => {
+            activeMonitorsByWorkspace.delete(projectName);
+            logger.error(`[AutonomousActivity:${projectName}] Failed to start ResponseMonitor:`, err);
+        });
     };
 
     // Auto-discover and connect already open Antigravity workspaces
