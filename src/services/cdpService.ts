@@ -1868,13 +1868,56 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP.');
         }
 
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
-        // Use tag-agnostic class-based selector to support both.
+        // Tag-agnostic & version-resilient: supports legacy (<div>), 1.21.6 (<button>),
+        // and modern Antigravity UI with data-testid attributes and popover panels.
         const expression = `(async () => {
-            return Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'))
-                .map(e => (e.textContent || '').trim().replace(/New$/, '').trim())
-                .filter(t => t.length > 0 && t.length < 60);
+            const cleanModelName = (t) => (t || '').trim()
+                .replace(/(New|Notice)$/i, '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+
+            const trigger = document.querySelector('[data-testid="model-selector-trigger"]')
+                || Array.from(document.querySelectorAll('button')).find(b => b.getAttribute('aria-haspopup') === 'menu' && (b.getAttribute('aria-label') || '').toLowerCase().includes('model'));
+
+            let wasOpened = false;
+            if (trigger && trigger.getAttribute('aria-expanded') !== 'true') {
+                trigger.click();
+                wasOpened = true;
+                await new Promise(r => setTimeout(r, 250));
+            }
+
+            const panel = document.querySelector('[data-testid="model-selector-panel"]')
+                || document.querySelector('[role="menu"]');
+
+            let items = [];
+            if (panel) {
+                items = Array.from(panel.querySelectorAll('[role="menuitem"], [data-testid="model-selector-item"], div.cursor-pointer, button'));
+            }
+            if (items.length === 0) {
+                items = Array.from(document.querySelectorAll('button, div'))
+                    .filter(e => e.className && typeof e.className === 'string'
+                        && e.className.includes('px-2') && e.className.includes('py-1') && e.className.includes('w-full') && e.className.includes('items-center'));
+            }
+
+            const modelList = [];
+            const seen = new Set();
+            const ignoredHeaders = new Set(['file', 'edit', 'selection', 'view', 'go', 'run', 'terminal', 'help', 'model']);
+
+            for (const el of items) {
+                const cleaned = cleanModelName(el.textContent);
+                if (cleaned && cleaned.length > 0 && cleaned.length < 60 && !cleaned.includes('\\n') && !seen.has(cleaned.toLowerCase())) {
+                    if (!ignoredHeaders.has(cleaned.toLowerCase())) {
+                        seen.add(cleaned.toLowerCase());
+                        modelList.push(cleaned);
+                    }
+                }
+            }
+
+            if (wasOpened && trigger) {
+                trigger.click();
+            }
+
+            return modelList;
         })()`;
 
         try {
@@ -1906,11 +1949,40 @@ export class CdpService extends EventEmitter {
         if (!this.isConnectedFlag || !this.ws) {
             return null;
         }
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
+
         const expression = `(() => {
-            var selected = Array.from(document.querySelectorAll('button, div'))
-                .find(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between') && e.className.includes('bg-gray-500/20') && !e.className.includes('hover:bg-gray-500/20'));
-            return selected ? (selected.textContent || '').trim().replace(/New$/, '').trim() : null;
+            const cleanText = (t) => (t || '').trim().replace(/(New|Notice)$/i, '').replace(/\\s+/g, ' ').trim();
+
+            // 1. Direct from trigger button
+            const trigger = document.querySelector('[data-testid="model-selector-trigger"]');
+            if (trigger) {
+                const text = cleanText(trigger.textContent);
+                if (text) return text;
+                const ariaLabel = trigger.getAttribute('aria-label') || '';
+                const m = ariaLabel.match(/current:\\s*([^\\)]+)/i);
+                if (m && m[1]) return cleanText(m[1]);
+            }
+
+            // 2. From open panel / menu items
+            const panel = document.querySelector('[data-testid="model-selector-panel"]') || document.querySelector('[role="menu"]');
+            if (panel) {
+                const selectedInPanel = Array.from(panel.querySelectorAll('[role="menuitem"], [data-testid="model-selector-item"], div, button'))
+                    .find(e => e.className && typeof e.className === 'string'
+                        && ((e.className.includes('bg-secondary') && !e.className.includes('hover:bg-secondary'))
+                            || (e.className.includes('bg-gray-500/20') && !e.className.includes('hover:bg-gray-500/20'))));
+                if (selectedInPanel) {
+                    const text = cleanText(selectedInPanel.textContent);
+                    if (text) return text;
+                }
+            }
+
+            // 3. Fallback: tag-agnostic search across all elements
+            const selected = Array.from(document.querySelectorAll('button, div'))
+                .find(e => e.className && typeof e.className === 'string'
+                    && e.className.includes('px-2') && e.className.includes('py-1') && e.className.includes('w-full') && e.className.includes('items-center')
+                    && ((e.className.includes('bg-secondary') && !e.className.includes('hover:bg-secondary'))
+                        || (e.className.includes('bg-gray-500/20') && !e.className.includes('hover:bg-gray-500/20'))));
+            return selected ? cleanText(selected.textContent) : null;
         })()`;
         try {
             const contextId = this.getPrimaryContextId();
@@ -1935,55 +2007,74 @@ export class CdpService extends EventEmitter {
             throw new Error('Not connected to CDP. Call connect() first.');
         }
 
-        // Antigravity 1.21.6+ uses <button> elements; older versions use <div>.
-        // Tag-agnostic class-based selector supports both versions.
-        // textContent may have "New" suffix on newly added models.
         const safeModel = JSON.stringify(modelName);
         const expression = `(async () => {
             const targetModel = ${safeModel};
+            const cleanText = (t) => (t || '').trim().replace(/(New|Notice)$/i, '').replace(/\\s+/g, ' ').trim();
+            const normalize = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+            const targetNorm = normalize(targetModel);
 
-            // Get all items in the model list (button in 1.21.6+, div in older)
-            const modelItems = Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'));
+            const trigger = document.querySelector('[data-testid="model-selector-trigger"]')
+                || Array.from(document.querySelectorAll('button')).find(b => b.getAttribute('aria-haspopup') === 'menu' && (b.getAttribute('aria-label') || '').toLowerCase().includes('model'));
 
-            if (modelItems.length === 0) {
-                return { ok: false, error: 'Model list not found. The dropdown may not be open.' };
+            if (trigger) {
+                const currentText = cleanText(trigger.textContent);
+                if (normalize(currentText) === targetNorm) {
+                    return { ok: true, model: currentText, alreadySelected: true };
+                }
             }
 
-            // Match target model by name (compare after removing New suffix)
-            const targetItem = modelItems.find(el => {
-                const text = (el.textContent || '').trim().replace(/New$/, '').trim();
-                return text === targetModel || text.toLowerCase() === targetModel.toLowerCase();
+            const wasOpen = trigger ? (trigger.getAttribute('aria-expanded') === 'true') : false;
+            if (trigger && !wasOpen) {
+                trigger.click();
+                await new Promise(r => setTimeout(r, 250));
+            }
+
+            const panel = document.querySelector('[data-testid="model-selector-panel"]')
+                || document.querySelector('[role="menu"]');
+
+            let candidateItems = [];
+            if (panel) {
+                candidateItems = Array.from(panel.querySelectorAll('[role="menuitem"], [data-testid="model-selector-item"], div.cursor-pointer, button'));
+            }
+            if (candidateItems.length === 0) {
+                candidateItems = Array.from(document.querySelectorAll('button, div'))
+                    .filter(e => e.className && typeof e.className === 'string'
+                        && e.className.includes('px-2') && e.className.includes('py-1') && e.className.includes('w-full') && e.className.includes('items-center'));
+            }
+
+            if (candidateItems.length === 0) {
+                return { ok: false, error: 'Model list not found. The dropdown could not be opened.' };
+            }
+
+            const targetItem = candidateItems.find(el => {
+                const t = cleanText(el.textContent);
+                const tNorm = normalize(t);
+                return tNorm === targetNorm || tNorm.includes(targetNorm) || targetNorm.includes(tNorm);
             });
 
             if (!targetItem) {
-                const available = modelItems.map(el => (el.textContent || '').trim().replace(/New$/, '').trim()).join(', ');
+                if (trigger && !wasOpen) trigger.click();
+                const available = candidateItems
+                    .map(el => cleanText(el.textContent))
+                    .filter(t => t.length > 0 && t.length < 50 && !['file', 'edit', 'selection', 'view', 'go', 'run', 'terminal', 'help', 'model'].includes(t.toLowerCase()))
+                    .filter((v, i, a) => a.indexOf(v) === i)
+                    .join(', ');
                 return { ok: false, error: 'Model "' + targetModel + '" not found. Available: ' + available };
             }
 
-            // Check if already selected
-            if (targetItem.className.includes('bg-gray-500/20') && !targetItem.className.includes('hover:bg-gray-500/20')) {
-                return { ok: true, model: targetModel, alreadySelected: true };
-            }
-
-            // Click to select model
+            // Click target item to select model
             targetItem.click();
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 400));
 
-            // Verify selection was applied
-            const updatedItems = Array.from(document.querySelectorAll('button, div'))
-                .filter(e => e.className.includes('px-2 py-1') && e.className.includes('w-full') && e.className.includes('items-center') && e.className.includes('justify-between'));
-            const selectedItem = updatedItems.find(el => {
-                const text = (el.textContent || '').trim().replace(/New$/, '').trim();
-                return text === targetModel || text.toLowerCase() === targetModel.toLowerCase();
-            });
+            const newTriggerText = trigger ? cleanText(trigger.textContent) : '';
+            const verified = normalize(newTriggerText) === targetNorm || targetNorm.includes(normalize(newTriggerText));
 
-            if (selectedItem && selectedItem.className.includes('bg-gray-500/20') && !selectedItem.className.includes('hover:bg-gray-500/20')) {
-                return { ok: true, model: targetModel, verified: true };
-            }
-
-            // Click succeeded but verification failed
-            return { ok: true, model: targetModel, verified: false };
+            return {
+                ok: true,
+                model: newTriggerText || targetModel,
+                verified
+            };
         })()`;
 
         try {
