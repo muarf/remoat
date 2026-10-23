@@ -110,10 +110,14 @@ export const DETECT_QUESTION_SCRIPT = `(() => {
 
     if (options.length === 0 && !continueBtn) return null;
 
+    const isMultiSelect = !!container.querySelector('input[type="checkbox"]') ||
+        Array.from(container.querySelectorAll('span')).some(s => (s.textContent || '').trim().toLowerCase() === 'multi-select');
+
     return {
         title: title || 'Permission / Question Required',
         subtitle: subtitle || undefined,
         options,
+        isMultiSelect,
         hasSkip: !!skipBtn,
         hasSubmit: !!continueBtn,
         submitDisabled: continueBtn ? continueBtn.disabled : false,
@@ -124,17 +128,22 @@ export const DETECT_QUESTION_SCRIPT = `(() => {
  * Script to select an option and click Submit in one action
  */
 export function buildSelectAndSubmitScript(optionId: string): string {
-    return `(() => {
+    return `(async () => {
         let selected = false;
         const inputs = Array.from(document.querySelectorAll('input[id*="ask-opt"], input[type="radio"], input[type="checkbox"]'));
         const targetInput = inputs.find(inp => inp.value === ${JSON.stringify(optionId)} || inp.id.endsWith('-' + ${JSON.stringify(optionId)}));
         if (targetInput) {
-            const label = targetInput.closest('label') || document.querySelector('label[for="' + targetInput.id + '"]');
-            if (label && typeof label.click === 'function') {
-                label.click();
-                selected = true;
-            } else if (typeof targetInput.click === 'function') {
-                targetInput.click();
+            // Only click if not already checked (avoids unchecking on repeat clicks)
+            if (!targetInput.checked) {
+                const label = targetInput.closest('label') || document.querySelector('label[for="' + targetInput.id + '"]');
+                if (label && typeof label.click === 'function') {
+                    label.click();
+                    selected = true;
+                } else if (typeof targetInput.click === 'function') {
+                    targetInput.click();
+                    selected = true;
+                }
+            } else {
                 selected = true;
             }
         }
@@ -148,18 +157,29 @@ export function buildSelectAndSubmitScript(optionId: string): string {
             }
         }
 
-        const submitBtn = document.querySelector('button[data-testid="interaction-continue-button"]');
-        if (submitBtn && typeof submitBtn.click === 'function') {
-            submitBtn.click();
-            return { ok: true, method: 'testid' };
+        // Wait for React state batching and DOM re-render
+        await new Promise(r => setTimeout(r, 150));
+
+        const getSubmitBtn = () => {
+            return document.querySelector('button[data-testid="interaction-continue-button"]')
+                || Array.from(document.querySelectorAll('button')).find(b => {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    return t.includes('submit') || t.includes('continue');
+                });
+        };
+
+        let submitBtn = getSubmitBtn();
+        // Wait up to 1000ms for submitBtn to become enabled
+        for (let i = 0; i < 20; i++) {
+            if (submitBtn && !submitBtn.disabled) break;
+            await new Promise(r => setTimeout(r, 50));
+            submitBtn = getSubmitBtn();
         }
-        const anySubmit = Array.from(document.querySelectorAll('button')).find(b => {
-            const t = (b.textContent || '').trim().toLowerCase();
-            return t.includes('submit') || t.includes('continue');
-        });
-        if (anySubmit && typeof anySubmit.click === 'function') {
-            anySubmit.click();
-            return { ok: true, method: 'text-fallback' };
+
+        if (submitBtn && !submitBtn.disabled) {
+            submitBtn.click();
+            submitBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            return { ok: true, method: 'interaction-continue-button' };
         }
 
         return { ok: selected };
@@ -167,21 +187,45 @@ export function buildSelectAndSubmitScript(optionId: string): string {
 }
 
 /**
+ * Script to click Submit button directly
+ */
+export const CLICK_SUBMIT_SCRIPT = `(async () => {
+    const getSubmitBtn = () => {
+        return document.querySelector('button[data-testid="interaction-continue-button"]')
+            || Array.from(document.querySelectorAll('button')).find(b => {
+                const t = (b.textContent || '').trim().toLowerCase();
+                return t.includes('submit') || t.includes('continue');
+            });
+    };
+
+    let submitBtn = getSubmitBtn();
+    for (let i = 0; i < 15; i++) {
+        if (submitBtn && !submitBtn.disabled) break;
+        await new Promise(r => setTimeout(r, 50));
+        submitBtn = getSubmitBtn();
+    }
+
+    if (!submitBtn) return { ok: false, error: 'Submit button not found' };
+    if (submitBtn.disabled) return { ok: false, error: 'Submit button is disabled' };
+
+    submitBtn.click();
+    submitBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    return { ok: true, method: 'submit' };
+})()`;
+
+/**
  * Script to click Skip button
  */
 export const CLICK_SKIP_SCRIPT = `(() => {
-    const skipBtn = document.querySelector('button[data-testid="interaction-skip-button"]');
+    const skipBtn = document.querySelector('button[data-testid="interaction-skip-button"]')
+        || Array.from(document.querySelectorAll('button')).find(b => {
+            const t = (b.textContent || '').trim().toLowerCase();
+            return t.includes('skip');
+        });
     if (skipBtn && typeof skipBtn.click === 'function') {
         skipBtn.click();
-        return { ok: true, method: 'testid' };
-    }
-    const anySkip = Array.from(document.querySelectorAll('button')).find(b => {
-        const t = (b.textContent || '').trim().toLowerCase();
-        return t.includes('skip');
-    });
-    if (anySkip && typeof anySkip.click === 'function') {
-        anySkip.click();
-        return { ok: true, method: 'text-fallback' };
+        skipBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        return { ok: true, method: 'interaction-skip-button' };
     }
     return { ok: false, error: 'Skip button not found' };
 })()`;
@@ -301,6 +345,19 @@ export class InteractiveQuestionDetector {
     }
 
     /**
+     * Click the Submit button directly.
+     */
+    async submit(): Promise<boolean> {
+        try {
+            const result = await this.runEvaluateScript(CLICK_SUBMIT_SCRIPT);
+            return result?.ok === true;
+        } catch (error) {
+            logger.error('[InteractiveQuestionDetector] Error in submit:', error);
+            return false;
+        }
+    }
+
+    /**
      * Click the Skip button.
      */
     async skip(): Promise<boolean> {
@@ -318,7 +375,7 @@ export class InteractiveQuestionDetector {
         const callParams: Record<string, unknown> = {
             expression,
             returnByValue: true,
-            awaitPromise: false,
+            awaitPromise: true,
         };
         if (contextId !== null) callParams.contextId = contextId;
         const result = await this.cdpService.call('Runtime.evaluate', callParams);

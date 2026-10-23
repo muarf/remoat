@@ -1,4 +1,4 @@
-import { buildQuestionUI, QUESTION_OPT_PREFIX, QUESTION_SKIP_PREFIX } from '../../src/ui/questionUi';
+import { buildQuestionUI, QUESTION_OPT_PREFIX, QUESTION_SKIP_PREFIX, QUESTION_SUBMIT_PREFIX } from '../../src/ui/questionUi';
 import { InteractiveQuestionInfo } from '../../src/services/interactiveQuestionDetector';
 
 describe('questionUi', () => {
@@ -54,5 +54,25 @@ describe('questionUi', () => {
         expect(rows.length).toBe(2);
         expect(rows[0][0].callback_data).toBe(`${QUESTION_OPT_PREFIX}project-x:prisma`);
         expect(rows[1][0].callback_data).toBe(`${QUESTION_OPT_PREFIX}project-x:drizzle`);
+    });
+
+    test('builds UI for multi-select question with Submit button', () => {
+        const info: InteractiveQuestionInfo = {
+            title: 'Select multiple features to enable',
+            options: [
+                { id: '1', text: 'Feature A', selected: false },
+                { id: '2', text: 'Feature B', selected: false },
+            ],
+            isMultiSelect: true,
+            hasSkip: true,
+            hasSubmit: true,
+        };
+
+        const { keyboard } = buildQuestionUI(info, 'my-ws');
+        const rows = (keyboard as any).inline_keyboard.filter((r: any) => r.length > 0);
+        expect(rows.length).toBe(4); // 2 options + 1 submit + 1 skip
+        expect(rows[2][0].callback_data).toBe(`${QUESTION_SUBMIT_PREFIX}my-ws`);
+        expect(rows[2][0].text).toContain('Submit');
+        expect(rows[3][0].callback_data).toBe(`${QUESTION_SKIP_PREFIX}my-ws`);
     });
 });

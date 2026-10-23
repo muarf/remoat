@@ -77,6 +77,7 @@ import {
 import {
     QUESTION_OPT_PREFIX,
     QUESTION_SKIP_PREFIX,
+    QUESTION_SUBMIT_PREFIX,
 } from '../ui/questionUi';
 import {
     INTERRUPT_QUEUE_PREFIX, INTERRUPT_STEER_PREFIX, INTERRUPT_STOP_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
@@ -2034,6 +2035,28 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 }
                 return;
             }
+        }
+
+        if (data.startsWith(QUESTION_SUBMIT_PREFIX)) {
+            const projectKey = data.substring(QUESTION_SUBMIT_PREFIX.length);
+            const detector = bridge.pool.getQuestionDetector(projectKey) ||
+                             (bridge.lastActiveWorkspace ? bridge.pool.getQuestionDetector(bridge.lastActiveWorkspace) : undefined);
+            if (!detector) {
+                await ctx.answerCallbackQuery({ text: 'Question detector not found.' });
+                return;
+            }
+            const success = await detector.submit();
+            if (success) {
+                await ctx.answerCallbackQuery({ text: 'Submitted!' });
+                try {
+                    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+                } catch (e) {
+                    logger.debug('[questionSubmit] Failed to clear markup:', e);
+                }
+            } else {
+                await ctx.answerCallbackQuery({ text: 'Failed to submit in IDE (is an option selected?).' });
+            }
+            return;
         }
 
         if (data.startsWith(QUESTION_SKIP_PREFIX)) {

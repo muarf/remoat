@@ -4,6 +4,7 @@ import { escapeHtml } from '../utils/telegramFormatter';
 
 export const QUESTION_OPT_PREFIX = 'q_opt:';
 export const QUESTION_SKIP_PREFIX = 'q_skip:';
+export const QUESTION_SUBMIT_PREFIX = 'q_sub:';
 
 const NUMBER_EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
@@ -59,6 +60,10 @@ export function buildQuestionUI(
         }
         keyboard.text(`${emoji} ${label}`, `${QUESTION_OPT_PREFIX}${projectKey}:${opt.id}`).row();
     });
+
+    if (info.isMultiSelect && info.hasSubmit) {
+        keyboard.text('✅ Submit', `${QUESTION_SUBMIT_PREFIX}${projectKey}`).row();
+    }
 
     if (info.hasSkip) {
         keyboard.text('⏭️ Skip', `${QUESTION_SKIP_PREFIX}${projectKey}`);

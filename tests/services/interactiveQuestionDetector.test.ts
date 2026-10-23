@@ -118,6 +118,26 @@ describe('InteractiveQuestionDetector', () => {
         );
     });
 
+    test('submit() executes submit script via CDP', async () => {
+        mockCdp.call.mockResolvedValueOnce({
+            result: { value: { ok: true } },
+        });
+
+        const detector = new InteractiveQuestionDetector({
+            cdpService: mockCdp,
+            onQuestionRequired: jest.fn(),
+        });
+
+        const success = await detector.submit();
+        expect(success).toBe(true);
+        expect(mockCdp.call).toHaveBeenCalledWith(
+            'Runtime.evaluate',
+            expect.objectContaining({
+                expression: expect.stringContaining('interaction-continue-button'),
+            })
+        );
+    });
+
     test('skip() executes skip script via CDP', async () => {
         mockCdp.call.mockResolvedValueOnce({
             result: { value: { ok: true } },
