@@ -1,5 +1,6 @@
 import { logger } from '../utils/logger';
 import { CDP_PORTS } from '../utils/cdpPorts';
+import { getLinuxDisplayEnv } from '../utils/displayUtils';
 import { EventEmitter } from 'events';
 import * as http from 'http';
 import * as net from 'net';
@@ -14,6 +15,8 @@ export interface CdpServiceOptions {
     maxReconnectAttempts?: number;
     /** Delay between reconnect attempts (ms). Default: 2000 */
     reconnectDelayMs?: number;
+    /** X11 DISPLAY override for Linux. If omitted, resolved via DISPLAY / config / auto-detection. */
+    display?: string;
 }
 
 export interface CdpContext {
@@ -195,6 +198,7 @@ const SELECTORS = {
 };
 
 export class CdpService extends EventEmitter {
+    private readonly options: CdpServiceOptions;
     private ports: number[];
     private isConnectedFlag: boolean = false;
     private ws: WebSocket | null = null;
@@ -224,6 +228,7 @@ export class CdpService extends EventEmitter {
 
     constructor(options: CdpServiceOptions = {}) {
         super();
+        this.options = options;
         this.ports = options.portsToScan || [...CDP_PORTS];
         if (options.cdpCallTimeout) this.cdpCallTimeout = options.cdpCallTimeout;
         this.maxReconnectAttempts = options.maxReconnectAttempts ?? 3;
@@ -857,10 +862,15 @@ export class CdpService extends EventEmitter {
         const useShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
         const finalCommand = useShell ? `"${command}"` : command;
         const finalArgs = useShell ? args.map((a) => `"${a}"`) : args;
+        const spawnEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            ...getLinuxDisplayEnv(this.options.display),
+        };
         await new Promise<void>((resolve, reject) => {
             const child = spawn(finalCommand, finalArgs, {
                 stdio: 'ignore',
                 shell: useShell,
+                env: spawnEnv,
             });
 
             child.once('error', (error) => {
@@ -1431,12 +1441,46 @@ export class CdpService extends EventEmitter {
         // 2. Send via Enter key
         await this.pressEnterToSend();
 
+        // If Antigravity placed the message into "Queued Messages", click "Send Now" to force dispatch
+        await new Promise(r => setTimeout(r, 250));
+        await this.clickQueuedSendNowButton(focusResult.contextId);
+
         // Follow the feed: pin the conversation to the newly sent turn after the
         // DOM has had a moment to append it (issue #4). Best-effort.
         await new Promise(r => setTimeout(r, 300));
         await this.scrollConversationToBottom(focusResult.contextId);
 
         return { ok: true, method: 'enter', contextId: focusResult.contextId };
+    }
+
+    /**
+     * Click the "Send Now" button on any queued messages if present in Antigravity.
+     * When Antigravity is running background commands or tools, submitting a message
+     * places it in Antigravity's internal "Queued Messages" list. Clicking "Send Now"
+     * forces Antigravity to steer/dispatch it to the agent immediately.
+     */
+    async clickQueuedSendNowButton(contextId?: number | null): Promise<boolean> {
+        try {
+            const expression = `(() => {
+                const btn = document.querySelector('button[aria-label="Send Now"], button[title="Send Now"]');
+                if (btn && typeof btn.click === 'function') {
+                    btn.click();
+                    return true;
+                }
+                const anyBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === 'Send Now');
+                if (anyBtn && typeof anyBtn.click === 'function') {
+                    anyBtn.click();
+                    return true;
+                }
+                return false;
+            })()`;
+            const callParams: Record<string, unknown> = { expression, returnByValue: true, awaitPromise: false };
+            if (contextId !== undefined && contextId !== null) callParams.contextId = contextId;
+            const res = await this.call('Runtime.evaluate', callParams);
+            return !!res?.result?.value;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -1463,6 +1507,10 @@ export class CdpService extends EventEmitter {
         await this.call('Input.insertText', { text });
         await new Promise(r => setTimeout(r, 200));
         await this.pressEnterToSend();
+
+        // If Antigravity placed the message into "Queued Messages", click "Send Now" to force dispatch
+        await new Promise(r => setTimeout(r, 250));
+        await this.clickQueuedSendNowButton(focusResult.contextId);
 
         // Follow the feed: pin the conversation to the newly sent turn (issue #4).
         await new Promise(r => setTimeout(r, 300));

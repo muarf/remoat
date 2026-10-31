@@ -22,6 +22,7 @@ import { TitleGeneratorService } from '../services/titleGeneratorService';
 import { CdpService } from '../services/cdpService';
 import { ChatSessionService } from '../services/chatSessionService';
 import { ResponseMonitor, RESPONSE_SELECTORS } from '../services/responseMonitor';
+import { UserMessageInfo } from '../services/userMessageDetector';
 import { ensureAntigravityRunning } from '../services/antigravityLauncher';
 import { getAntigravityCdpHint } from '../utils/pathUtils';
 import { AutoAcceptService } from '../services/autoAcceptService';
@@ -32,7 +33,11 @@ import {
     ensureApprovalDetector,
     ensureErrorPopupDetector,
     ensurePlanningDetector,
+    ensureQuestionDetector,
+    ensureUserMessageDetector,
     getCurrentCdp,
+    getCurrentChatTitle,
+    resolveApprovalChannelForCurrentChat,
     initCdpBridge,
     registerApprovalSessionChannel,
     registerApprovalWorkspaceChannel,
@@ -69,7 +74,11 @@ import {
     buildPlanNotificationUI, buildPlanContentUI, paginatePlanContent,
 } from '../ui/planUi';
 import {
-    INTERRUPT_QUEUE_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
+    QUESTION_OPT_PREFIX,
+    QUESTION_SKIP_PREFIX,
+} from '../ui/questionUi';
+import {
+    INTERRUPT_QUEUE_PREFIX, INTERRUPT_STEER_PREFIX, INTERRUPT_STOP_PREFIX, INTERRUPT_NOW_PREFIX, INTERRUPT_DISCARD_PREFIX,
     buildInterruptUI, safeCallbackKey,
 } from '../ui/queueUi';
 import {
@@ -79,6 +88,7 @@ import {
     drainPendingInterrupts,
     hasPendingInterrupts,
     consumeBypass,
+    setBypass,
     MAX_QUEUE_DEPTH,
 } from '../services/interruptState';
 
@@ -855,7 +865,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
     await ensureAntigravityRunning();
 
-    const bridge = initCdpBridge(config.autoApproveFileEdits);
+    const bridge = initCdpBridge(config.autoApproveFileEdits, config.display);
     bridge.botToken = config.telegramBotToken;
 
     const chatSessionService = new ChatSessionService();
@@ -981,8 +991,162 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 ensureApprovalDetector(bridge, cdp, projectName);
                 ensureErrorPopupDetector(bridge, cdp, projectName);
                 ensurePlanningDetector(bridge, cdp, projectName);
+                ensureQuestionDetector(bridge, cdp, projectName);
+                ensureUserMessageDetector(bridge, cdp, projectName, (info) => {
+                    handleExternalUserMessage(projectName, cdp, info).catch((err) => {
+                        logger.error(`[ExternalMessage:${projectName}] Handling failed:`, err);
+                    });
+                });
             },
         });
+
+    // Helper to parse stored channel key
+    const parseStoredChannelKey = (key: string): TelegramChannel => {
+        const parts = key.split(':');
+        if (parts.length === 2 && !isNaN(Number(parts[1]))) {
+            return { chatId: parts[0], threadId: Number(parts[1]) };
+        }
+        return { chatId: key };
+    };
+
+    // Handle messages typed directly into Antigravity IDE (e.g. from VNC / Desktop)
+    const handleExternalUserMessage = async (projectName: string, cdp: CdpService, info: UserMessageInfo) => {
+        logger.info(`[ExternalMessage:${projectName}] Detected message from IDE: "${info.text.slice(0, 50)}..."`);
+        const currentChatTitle = await getCurrentChatTitle(cdp);
+        let targetChannel = resolveApprovalChannelForCurrentChat(bridge, projectName, currentChatTitle)
+            || bridge.approvalChannelByWorkspace.get(projectName);
+
+        if (!targetChannel) {
+            // Fallback: look up in workspaceBindingRepo
+            const binding = workspaceBindingRepo.findAll().find(b => b.workspacePath === projectName);
+            if (binding) {
+                targetChannel = parseStoredChannelKey(binding.channelId);
+                registerApprovalWorkspaceChannel(bridge, projectName, targetChannel);
+            }
+        }
+
+        if (!targetChannel) {
+            logger.warn(`[ExternalMessage:${projectName}] No target channel found for external message.`);
+            return;
+        }
+
+        // 1. Notify Telegram of the message typed in IDE
+        try {
+            await bot.api.sendMessage(
+                targetChannel.chatId,
+                `👤 <b>Message from IDE (${escapeHtml(projectName)})</b>\n\n<i>${escapeHtml(info.text)}</i>`,
+                { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+            );
+        } catch (err) {
+            logger.error(`[ExternalMessage:${projectName}] Failed to post message notice:`, err);
+        }
+
+        // 2. Attach ResponseMonitor to relay assistant's generation
+        let statusMsgId: number | null = null;
+        try {
+            const statusMsg = await bot.api.sendMessage(
+                targetChannel.chatId,
+                `💭 <i>Thinking in ${escapeHtml(projectName)}...</i>`,
+                { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+            );
+            statusMsgId = statusMsg.message_id;
+        } catch (e) {
+            logger.debug(`[ExternalMessage:${projectName}] Failed to post status:`, e);
+        }
+
+        const monitor = new ResponseMonitor({
+            cdpService: cdp,
+            pollIntervalMs: 2000,
+            extractionMode: config.extractionMode,
+            onComplete: async (finalText, meta) => {
+                logger.info(`[ExternalMessage:${projectName}] Response complete (length=${finalText.length})`);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+
+                let freshText = '';
+                let freshIsHtml = false;
+                try {
+                    const contextId = cdp.getPrimaryContextId();
+                    const evalParams: Record<string, unknown> = {
+                        expression: extractAssistantSegmentsPayloadScript(),
+                        returnByValue: true,
+                        awaitPromise: true,
+                    };
+                    if (contextId !== null && contextId !== undefined) evalParams.contextId = contextId;
+                    const freshResult = await cdp.call('Runtime.evaluate', evalParams);
+                    const freshClassified = classifyAssistantSegments(freshResult?.result?.value);
+                    if (freshClassified.diagnostics.source === 'dom-structured' && freshClassified.finalOutputText.trim()) {
+                        freshText = freshClassified.finalOutputText.trim();
+                        freshIsHtml = true;
+                    }
+                } catch (e) {
+                    logger.debug('[ExternalMessage] Fresh structured extraction failed:', e);
+                }
+
+                const responseText = (freshText && freshText.length >= finalText.length)
+                    ? freshText
+                    : (finalText || '');
+
+                if (!responseText || !responseText.trim() || !targetChannel) return;
+
+                const isHtml = freshIsHtml || meta?.source === 'structured';
+                const formatted = isHtml ? responseText : formatForTelegram(responseText);
+
+                const chunks = splitTelegramHtml(formatted, 4000);
+                for (const chunk of chunks) {
+                    try {
+                        await bot.api.sendMessage(
+                            targetChannel.chatId,
+                            chunk,
+                            { parse_mode: 'HTML', message_thread_id: targetChannel.threadId }
+                        );
+                    } catch (err) {
+                        logger.error(`[ExternalMessage:${projectName}] Failed to send chunk:`, err);
+                    }
+                }
+            },
+            onTimeout: async () => {
+                logger.warn(`[ExternalMessage:${projectName}] ResponseMonitor timed out`);
+                if (statusMsgId && targetChannel) {
+                    try {
+                        await bot.api.deleteMessage(targetChannel.chatId, statusMsgId);
+                    } catch {}
+                }
+            },
+        });
+
+        monitor.start();
+    };
+
+    // Auto-discover and connect already open Antigravity workspaces
+    const autoConnectOpenWorkspaces = async () => {
+        try {
+            const bindings = workspaceBindingRepo.findAll();
+            if (bindings.length === 0) return;
+
+            const res = await fetch('http://127.0.0.1:9223/json').catch(() => null);
+            if (!res || !res.ok) return;
+            const targets = await res.json() as Array<{ type: string; title: string }>;
+            const pageTitles = targets.filter(t => t.type === 'page').map(t => t.title.toLowerCase());
+
+            for (const binding of bindings) {
+                const wsName = binding.workspacePath;
+                const isPageOpen = pageTitles.some(title => title.includes(wsName.toLowerCase()));
+                if (isPageOpen && !bridge.pool.getConnected(wsName)) {
+                    const ch = parseStoredChannelKey(binding.channelId);
+                    logger.info(`[AutoConnect] Connecting open workspace "${wsName}" to channel ${binding.channelId}`);
+                    await resolveWorkspaceAndCdp(ch).catch((e) => {
+                        logger.debug(`[AutoConnect] Failed to connect "${wsName}":`, e);
+                    });
+                }
+            }
+        } catch (e) {
+            logger.debug('[AutoConnect] Discovery cycle failed:', e);
+        }
+    };
 
     const replyHtml = async (ctx: Context, text: string, keyboard?: InlineKeyboard) => {
         await ctx.reply(text, {
@@ -1671,6 +1835,56 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
+        // Interactive question & MCP permission buttons
+        if (data.startsWith(QUESTION_OPT_PREFIX)) {
+            const rest = data.substring(QUESTION_OPT_PREFIX.length);
+            const colonIdx = rest.indexOf(':');
+            if (colonIdx !== -1) {
+                const projectKey = rest.substring(0, colonIdx);
+                const optId = rest.substring(colonIdx + 1);
+                const detector = bridge.pool.getQuestionDetector(projectKey) ||
+                                 (bridge.lastActiveWorkspace ? bridge.pool.getQuestionDetector(bridge.lastActiveWorkspace) : undefined);
+                if (!detector) {
+                    await ctx.answerCallbackQuery({ text: 'Question detector not found.' });
+                    return;
+                }
+                const success = await detector.selectAndSubmit(optId);
+                if (success) {
+                    await ctx.answerCallbackQuery({ text: 'Option submitted!' });
+                    try {
+                        await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+                    } catch (e) {
+                        logger.debug('[questionOpt] Failed to clear markup:', e);
+                    }
+                } else {
+                    await ctx.answerCallbackQuery({ text: 'Failed to submit option in IDE.' });
+                }
+                return;
+            }
+        }
+
+        if (data.startsWith(QUESTION_SKIP_PREFIX)) {
+            const projectKey = data.substring(QUESTION_SKIP_PREFIX.length);
+            const detector = bridge.pool.getQuestionDetector(projectKey) ||
+                             (bridge.lastActiveWorkspace ? bridge.pool.getQuestionDetector(bridge.lastActiveWorkspace) : undefined);
+            if (!detector) {
+                await ctx.answerCallbackQuery({ text: 'Question detector not found.' });
+                return;
+            }
+            const success = await detector.skip();
+            if (success) {
+                await ctx.answerCallbackQuery({ text: 'Skipped!' });
+                try {
+                    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+                } catch (e) {
+                    logger.debug('[questionSkip] Failed to clear markup:', e);
+                }
+            } else {
+                await ctx.answerCallbackQuery({ text: 'Skip button not found in IDE.' });
+            }
+            return;
+        }
+
         // Error popup buttons
         const errorAction = parseErrorPopupCustomId(data);
         if (errorAction) {
@@ -1704,14 +1918,25 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
-        // Interrupt buttons (Queue / Send Now / Discard)
-        if (data.startsWith(INTERRUPT_QUEUE_PREFIX) || data.startsWith(INTERRUPT_NOW_PREFIX) || data.startsWith(INTERRUPT_DISCARD_PREFIX)) {
+        // Interrupt buttons (Queue / Send anyway / Stop & Replace / Discard)
+        if (
+            data.startsWith(INTERRUPT_QUEUE_PREFIX) ||
+            data.startsWith(INTERRUPT_STEER_PREFIX) ||
+            data.startsWith(INTERRUPT_STOP_PREFIX) ||
+            data.startsWith(INTERRUPT_NOW_PREFIX) ||
+            data.startsWith(INTERRUPT_DISCARD_PREFIX)
+        ) {
             const targetKey = data.startsWith(INTERRUPT_QUEUE_PREFIX)
                 ? data.slice(INTERRUPT_QUEUE_PREFIX.length)
-                : data.startsWith(INTERRUPT_NOW_PREFIX)
-                    ? data.slice(INTERRUPT_NOW_PREFIX.length)
-                    : data.slice(INTERRUPT_DISCARD_PREFIX.length);
+                : data.startsWith(INTERRUPT_STEER_PREFIX)
+                    ? data.slice(INTERRUPT_STEER_PREFIX.length)
+                    : data.startsWith(INTERRUPT_STOP_PREFIX)
+                        ? data.slice(INTERRUPT_STOP_PREFIX.length)
+                        : data.startsWith(INTERRUPT_NOW_PREFIX)
+                            ? data.slice(INTERRUPT_NOW_PREFIX.length)
+                            : data.slice(INTERRUPT_DISCARD_PREFIX.length);
 
+            // 1. DISCARD
             if (data.startsWith(INTERRUPT_DISCARD_PREFIX)) {
                 // Discard the first pending interrupt and clean up any attached images
                 const discarded = shiftPendingInterrupt(targetKey);
@@ -1723,6 +1948,43 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                 return;
             }
 
+            // 2. QUEUE
+            if (data.startsWith(INTERRUPT_QUEUE_PREFIX)) {
+                const pending = getFirstPendingInterrupt(targetKey);
+                if (!pending) {
+                    try { await ctx.editMessageText('✅ Task finished — your message was already processed.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                    await ctx.answerCallbackQuery({ text: 'Already processed' });
+                    return;
+                }
+
+                const projectName = targetKey.startsWith('ws:') ? targetKey.slice(3) : null;
+                const freshCdp = projectName ? bridge.pool.getConnected(projectName) : null;
+                const dispatchCdp = freshCdp ?? pending.cdp;
+
+                // If workspace is no longer busy, dispatch immediately
+                if (!promptDispatcher.isBusy(pending.channel, dispatchCdp)) {
+                    const shifted = shiftPendingInterrupt(targetKey);
+                    if (shifted) {
+                        try { await ctx.editMessageText('⚡ Task finished — sending message now…'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                        await ctx.answerCallbackQuery({ text: 'Sending now' });
+                        promptDispatcher.send({
+                            channel: shifted.channel,
+                            prompt: shifted.prompt,
+                            cdp: dispatchCdp,
+                            inboundImages: shifted.inboundImages,
+                            options: shifted.options,
+                        }).catch((e) => { logger.error('[interrupt:queue] dispatch failed:', e); });
+                        return;
+                    }
+                }
+
+                try {
+                    await ctx.editMessageText('⏳ <b>Message queued.</b> Will be sent when current task completes.', { parse_mode: 'HTML' });
+                } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Queued' });
+                return;
+            }
+
             const pending = shiftPendingInterrupt(targetKey);
             if (!pending) {
                 try { await ctx.editMessageText('✅ Task finished — your message was already processed.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
@@ -1731,14 +1993,40 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             }
 
             // Re-resolve CDP from pool to avoid dispatching with a stale reference.
-            // For the stop-button click we still use pending.cdp (it targets the running session).
             const projectName = targetKey.startsWith('ws:') ? targetKey.slice(3) : null;
             const freshCdp = projectName ? bridge.pool.getConnected(projectName) : null;
+            const dispatchCdp = freshCdp ?? pending.cdp;
 
-            if (data.startsWith(INTERRUPT_NOW_PREFIX)) {
-                // Stop current generation, then send the new prompt
-                try { await ctx.editMessageText('⚡ Stopping current task and sending your message…'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
-                await ctx.answerCallbackQuery({ text: 'Stopping & sending...' });
+            // 3. SEND ANYWAY (STEER)
+            if (data.startsWith(INTERRUPT_STEER_PREFIX)) {
+                try {
+                    await ctx.editMessageText('⚡ <b>Sending anyway…</b> Injected into Antigravity concurrently.', { parse_mode: 'HTML' });
+                } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Sending anyway...' });
+
+                const wsKey = promptDispatcher.getWorkspaceKey(pending.channel, dispatchCdp);
+                promptDispatcher.resetWorkspaceLock(wsKey);
+                setBypass(safeCallbackKey(wsKey));
+
+                // Small pause to let UI react before injecting next prompt
+                await new Promise(r => setTimeout(r, 200));
+
+                promptDispatcher.send({
+                    channel: pending.channel,
+                    prompt: pending.prompt,
+                    cdp: dispatchCdp,
+                    inboundImages: pending.inboundImages,
+                    options: pending.options,
+                }).catch((e) => { logger.error('[interrupt:steer] dispatch failed:', e); });
+                return;
+            }
+
+            // 4. STOP & REPLACE
+            if (data.startsWith(INTERRUPT_STOP_PREFIX) || data.startsWith(INTERRUPT_NOW_PREFIX)) {
+                try {
+                    await ctx.editMessageText('🛑 Stopping current task and sending new message…');
+                } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
+                await ctx.answerCallbackQuery({ text: 'Stopping & replacing...' });
 
                 // Click the stop button in Antigravity (use pending.cdp — it targets the running session)
                 try {
@@ -1747,32 +2035,25 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     if (contextId !== null) callParams.contextId = contextId;
                     await pending.cdp.call('Runtime.evaluate', callParams);
                     userStopRequestedChannels.add(channelKey(pending.channel));
-                } catch (e) { logger.debug('[interrupt:now] Stop button click failed:', e); }
+                } catch (e) { logger.debug('[interrupt:stop] Stop button click failed:', e); }
 
-                const dispatchCdp = freshCdp ?? pending.cdp;
+                // Clear workspace lock so we don't deadlock on a hung background task
+                const wsKey = promptDispatcher.getWorkspaceKey(pending.channel, dispatchCdp);
+                promptDispatcher.resetWorkspaceLock(wsKey);
+                setBypass(safeCallbackKey(wsKey));
+
+                // Small pause to let UI react before injecting next prompt
+                await new Promise(r => setTimeout(r, 400));
+
                 promptDispatcher.send({
                     channel: pending.channel,
                     prompt: pending.prompt,
                     cdp: dispatchCdp,
                     inboundImages: pending.inboundImages,
                     options: pending.options,
-                }).catch((e) => { logger.error('[interrupt:now] dispatch failed:', e); });
+                }).catch((e) => { logger.error('[interrupt:stop] dispatch failed:', e); });
                 return;
             }
-
-            // INTERRUPT_QUEUE_PREFIX — queue to run after current task finishes
-            try { await ctx.editMessageText('📥 Message queued — will send after current task.'); } catch (e) { logger.debug('[editMsg] Telegram edit failed:', e); }
-            await ctx.answerCallbackQuery({ text: 'Queued' });
-
-            const dispatchCdp = freshCdp ?? pending.cdp;
-            promptDispatcher.send({
-                channel: pending.channel,
-                prompt: pending.prompt,
-                cdp: dispatchCdp,
-                inboundImages: pending.inboundImages,
-                options: pending.options,
-            }).catch((e) => { logger.error('[interrupt:queue] dispatch failed:', e); });
-            return;
         }
 
         // Cleanup buttons
@@ -2022,14 +2303,15 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             }
 
             if (position === 1) {
-                const keyboard = new InlineKeyboard()
-                    .text('📥 Queue', `interrupt:queue:${interruptKey}`)
-                    .text('⚡ Stop & Send Now', `interrupt:now:${interruptKey}`)
-                    .text('🗑 Discard', `interrupt:discard:${interruptKey}`);
-                await replyHtml(ctx,
-                    `⏳ <b>AI is still generating a response…</b>\n\n🖼️ Photo message queued.`,
-                    keyboard,
-                );
+                const promptDesc = caption ? `🖼️ ${caption}` : '🖼️ Photo message';
+                const { text: uiText, keyboard } = buildInterruptUI(interruptKey, promptDesc);
+                const sent = await bot.api.sendMessage(ch.chatId, uiText, {
+                    parse_mode: 'HTML',
+                    message_thread_id: ch.threadId,
+                    reply_markup: keyboard,
+                });
+                const pending = getFirstPendingInterrupt(interruptKey);
+                if (pending) pending.interruptMsgId = sent.message_id;
             } else {
                 await ctx.reply(`📥 Photo message queued (#${position} in line)`);
             }
@@ -2122,15 +2404,14 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             }
 
             if (position === 1) {
-                const keyboard = new InlineKeyboard()
-                    .text('📥 Queue', `interrupt:queue:${interruptKey}`)
-                    .text('⚡ Stop & Send Now', `interrupt:now:${interruptKey}`)
-                    .text('🗑 Discard', `interrupt:discard:${interruptKey}`);
-                const preview = transcript.length > 80 ? transcript.slice(0, 77) + '…' : transcript;
-                await replyHtml(ctx,
-                    `⏳ <b>AI is still generating a response…</b>\n\n🎙️ Voice: <i>${escapeHtml(preview)}</i>`,
-                    keyboard,
-                );
+                const { text: uiText, keyboard } = buildInterruptUI(interruptKey, `🎙️ Voice: ${transcript}`);
+                const sent = await bot.api.sendMessage(ch.chatId, uiText, {
+                    parse_mode: 'HTML',
+                    message_thread_id: ch.threadId,
+                    reply_markup: keyboard,
+                });
+                const pending = getFirstPendingInterrupt(interruptKey);
+                if (pending) pending.interruptMsgId = sent.message_id;
             } else {
                 await ctx.reply(`📥 Voice message queued (#${position} in line)`);
             }
@@ -2189,6 +2470,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     { command: 'ping', description: 'Check latency' },
                 ]);
                 logger.info('Telegram command menu registered successfully');
+                setTimeout(autoConnectOpenWorkspaces, 1000);
+                setInterval(autoConnectOpenWorkspaces, 15000);
             } catch (err) {
                 logger.error('Failed to register command menu:', err);
             }

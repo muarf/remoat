@@ -111,6 +111,8 @@ export const RESPONSE_SELECTORS = {
             /^stop$/,
             /^stop generating$/,
             /^stop response$/,
+            /^cancel(\s*\(.*\))?$/,
+            /^annuler$/,
             /^停止$/,
             /^生成を停止$/,
             /^応答を停止$/,
@@ -157,6 +159,8 @@ export const RESPONSE_SELECTORS = {
             /^stop$/,
             /^stop generating$/,
             /^stop response$/,
+            /^cancel(\s*\(.*\))?$/,
+            /^annuler$/,
             /^停止$/,
             /^生成を停止$/,
             /^応答を停止$/,
@@ -356,7 +360,7 @@ export const RESPONSE_SELECTORS = {
         }
         if (!isGenerating) {
             const normalize = (value) => (value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-            const STOP_PATTERNS = [/^stop$/, /^stop generating$/, /^stop response$/, /^停止$/, /^生成を停止$/, /^応答を停止$/];
+            const STOP_PATTERNS = [/^stop$/, /^stop generating$/, /^stop response$/, /^cancel(\s*\(.*\))?$/, /^annuler$/, /^停止$/, /^生成を停止$/, /^応答を停止$/];
             const isStopLabel = (value) => { const n = normalize(value); return n ? STOP_PATTERNS.some((re) => re.test(n)) : false; };
             outer: for (const scope of scopes) {
                 const buttons = scope.querySelectorAll('button, [role="button"]');
